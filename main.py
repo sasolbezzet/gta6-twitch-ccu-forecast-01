@@ -1,16 +1,14 @@
-"""gta6-twitch-ccu-forecast-01: Empirical Diurnal Twitch CCU Forecaster in Python 3.13.
+"""gta6-twitch-ccu-forecast-01: Size-Weighted Log-Ratio Regression Forecaster in Python 3.13.
 
-Standard library only: no network, no pip packages.
-Forecasts the 24-hour Twitch live concurrent viewers (CCU) in the Grand Theft Auto VI category
-by combining hour 1's observed print with empirical diurnal multipliers extracted from major AAA launches
-(Elden Ring, Cyberpunk 2077, Hogwarts Legacy, God of War Ragnarök, Marvel's Spider-Man 2, RDR2)
-and widening pinball-calibrated quantiles (0.05, 0.25, 0.50, 0.75, 0.95).
+Standard library only: deterministic, no network, no random walk drift.
+Forecasts the 24-hour Twitch concurrent viewers (CCU) in the Grand Theft Auto VI category
+by fitting size-weighted log-log regressions r_h ~ a_h + b_h * ln(p1) across major launch comparables,
+smoothed across neighbouring hours with calibrated residual quantile spreads (0.05, 0.25, 0.50, 0.75, 0.95).
 """
 
 import json
 import math
 import os
-import statistics
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,86 +19,161 @@ INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
-SIGMA = 0.12
+Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
 
-# Calibrated median hourly trajectory relative to hour 1 (UTC midnight) across major AAA launches
-DEFAULT_CURVE = [
-    1.0, 0.8869, 0.7226, 0.7375, 0.7846, 0.8362,
-    0.7933, 0.7549, 0.7309, 0.6965, 0.7833, 0.9148,
-    0.9315, 1.0382, 1.1645, 1.2229, 1.278, 1.3787,
-    1.4984, 1.5348, 1.4941, 1.6093, 1.6849, 1.1884
-]
+WEIGHT_FLOOR = 0.2
+WEIGHT_OFFSET = 5.0
+MEDIAN_BLEND = 0.15
+SPREAD_MULT = 0.50
+SMOOTH_HALF_WINDOW = 1
 
 
-def round2(x: float) -> float | int:
-    scaled = x * 100
+def parse_ts(text: str) -> datetime:
+    """Parse ISO-8601 UTC timestamp."""
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    if n % 2:
+        return ordered[n // 2]
+    return 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
+
+
+def weighted_line(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
+    """Size-weighted least squares fit: y ~ a + b*x."""
+    total = sum(ws)
+    if total <= 0:
+        return 0.0, 0.0
+    mx = sum(w * x for w, x in zip(ws, xs)) / total
+    my = sum(w * y for w, y in zip(ws, ys)) / total
+    vx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
+    if vx <= 0:
+        return my, 0.0
+    b = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys)) / vx
+    return my - b * mx, b
+
+
+def round2_half_up(x: float) -> float | int:
+    """Round to 2 decimals half up (aligned with JavaScript Math.round)."""
+    scaled = x * 100.0
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    value = whole / 100
-    return int(value) if value.is_integer() else value
+    value = whole / 100.0
+    return int(value) if float(value).is_integer() else value
 
 
-def get_curve_from_comparables(comparables: list) -> list[float]:
+def comparable_curves(case: dict) -> list[tuple[float, dict[int, float]]]:
+    """Extract valid donor curves from comparables: (log_first, {hour: log_ratio})."""
     curves = []
-    for c in comparables:
-        day_start = c.get("day_start")
-        if not day_start:
+    for comp in case.get("comparables") or []:
+        day_start_raw = comp.get("day_start")
+        if not day_start_raw:
             continue
-        hourly_by_from = {h["from"]: h["viewers"] for h in c.get("hourly", [])}
         try:
-            dt_start = datetime.fromisoformat(day_start.replace("Z", "+00:00"))
+            day_start = parse_ts(day_start_raw)
         except Exception:
             continue
+        by_hour: dict[int, float] = {}
+        for point in comp.get("hourly") or []:
+            v = point.get("viewers")
+            if v is None or v <= 0:
+                continue
+            ts_str = point.get("from")
+            if not ts_str:
+                continue
+            try:
+                hour = int((parse_ts(ts_str) - day_start).total_seconds() // 3600) + 1
+            except Exception:
+                continue
+            if 1 <= hour <= 24:
+                by_hour[hour] = float(v)
+        if 1 not in by_hour or len(by_hour) < 20:
+            continue
+        first = by_hour[1]
+        if first <= 0:
+            continue
+        curves.append((
+            math.log(first),
+            {h: math.log(by_hour[h] / first) for h in range(2, 25) if h in by_hour}
+        ))
+    return curves
 
-        day_viewers = []
-        for h in range(24):
-            from_ts = datetime.fromtimestamp(dt_start.timestamp() + h * 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:00:00Z")
-            v = hourly_by_from.get(from_ts)
-            day_viewers.append(v)
 
-        if day_viewers[0] and day_viewers[0] >= 10000 and all(v is not None for v in day_viewers):
-            ratios = [v / day_viewers[0] for v in day_viewers]
-            curves.append(ratios)
-
-    if len(curves) >= 5:
-        med = []
-        for h in range(24):
-            med.append(statistics.median([r[h] for r in curves]))
-        return med
-    return DEFAULT_CURVE
+def fit_hour(curves: list[tuple[float, dict[int, float]]], hour: int, log_first: float):
+    rows = [(lv, ratios[hour]) for lv, ratios in curves if hour in ratios]
+    if len(rows) < 8:
+        return None
+    xs = [r[0] for r in rows]
+    ys = [r[1] for r in rows]
+    ws = [max(WEIGHT_FLOOR, x - WEIGHT_OFFSET) for x in xs]
+    a, b = weighted_line(xs, ys, ws)
+    resid = [y - (a + b * x) for x, y in zip(xs, ys)]
+    dof = max(1, len(resid) - 2)
+    sigma = max(0.05, math.sqrt(sum(r * r for r in resid) / dof))
+    x = min(max(log_first, min(xs)), max(xs))
+    mu_reg = a + b * x
+    mu = (1.0 - MEDIAN_BLEND) * mu_reg + MEDIAN_BLEND * median(ys)
+    return mu, sigma, b, (xs, ys, ws)
 
 
 def forecast_case(case: dict, name: str) -> dict:
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    first = next((k for k in case["known"] if k["hour"] == 1), None)
+    if list(case.get("levels") or []) != LEVELS:
+        raise ValueError(f"{name} asks for levels {case.get('levels')}, not {LEVELS}")
+    first = next((k for k in case.get("known", []) if k.get("hour") == 1), None)
     if first is None:
         raise ValueError(f"{name} has no hour-1 print")
+    p1 = max(1.0, float(first.get("viewers", 1.0)))
+    log_first = math.log(p1)
+    curves = comparable_curves(case)
 
-    p1 = max(1, first["viewers"])
-    curve = get_curve_from_comparables(case.get("comparables", []))
+    fits = {}
+    for row in case.get("forecast", []):
+        hour = row["hour"]
+        fit = fit_hour(curves, hour, log_first)
+        if fit is not None:
+            fits[hour] = fit
 
-    hours_res = []
-    for row in case["forecast"]:
-        h = row["hour"]
-        h_idx = h - 1
-        mult = curve[h_idx] if 0 <= h_idx < len(curve) else 1.0
+    if fits and SMOOTH_HALF_WINDOW > 0:
+        hours = sorted(fits.keys())
+        slopes = {h: fits[h][2] for h in hours}
+        for h in hours:
+            near = [hh for hh in hours if abs(hh - h) <= SMOOTH_HALF_WINDOW]
+            slopes[h] = sum(slopes[hh] for hh in near) / len(near)
+        for h in hours:
+            mu, sigma, _b, (xs, ys, ws) = fits[h]
+            b = slopes[h]
+            a = sum(w * (y - b * x) for w, x, y in zip(ws, xs, ys)) / sum(ws)
+            x = min(max(log_first, min(xs)), max(xs))
+            mu_reg = a + b * x
+            mu = (1.0 - MEDIAN_BLEND) * mu_reg + MEDIAN_BLEND * median(ys)
+            fits[h] = (mu, sigma, b, (xs, ys, ws))
 
-        expected = p1 * mult
-        spread = SIGMA * math.sqrt(h - 1)
+    rows = []
+    for row in case.get("forecast", []):
+        hour = row["hour"]
+        if hour in fits:
+            mu, sigma, _b, _data = fits[hour]
+            spread = SPREAD_MULT * sigma
+            quantiles = [p1 * math.exp(mu + z * spread) for z in Z]
+        else:
+            quantiles = [p1 * math.exp(z * 0.15 * math.sqrt(hour - 1)) for z in Z]
 
-        q_vals = [round2(expected * math.exp(z * spread)) for z in Z]
+        cleaned = []
+        prev = 0.0
+        for q in quantiles:
+            q = min(max(q, 1.0), 1_000_000_000.0)
+            q = max(q, prev)
+            cleaned.append(round2_half_up(q))
+            prev = cleaned[-1]
+        rows.append({"hour": hour, "q": cleaned})
 
-        # Enforce strict quantile ordering
-        for i in range(1, len(q_vals)):
-            if q_vals[i] < q_vals[i - 1]:
-                q_vals[i] = q_vals[i - 1]
-
-        hours_res.append({"hour": h, "q": q_vals})
-
-    return {"hours": hours_res}
+    rows.sort(key=lambda r: r["hour"])
+    return {"hours": rows}
 
 
 def main() -> None:
@@ -108,7 +181,8 @@ def main() -> None:
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+        out = OUTPUT_DIR / f"{path.stem}.out"
+        out.write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
